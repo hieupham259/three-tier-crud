@@ -1,0 +1,6 @@
+# Files in this repo are consumed by Linux containers (nginx.conf, Dockerfile, shell) and by
+# Node/Python toolchains. Force LF on checkout regardless of core.autocrlf on the developer host.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
