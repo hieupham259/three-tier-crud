@@ -155,58 +155,59 @@ curl -s -o /dev/null -w '%{http_code}\n' -X DELETE "$BASE/api/items/phase2-smoke
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/items/phase2-smoke-001"             # 404
 ```
 
-## 6. Test và build
+## 6. Test trên máy build và build image
+
+Các lệnh test local dưới đây khớp checkpoint §5.3 của runbook và chạy trong **Git Bash** trên máy
+build Windows, từ repository `E:/courses/Ansible/three-tier-crud`.
 
 ### 6.1. Frontend (Node 24 LTS khuyến nghị; tối thiểu `^20.19.0 || >=22.12.0`)
 
 ```bash
-cd frontend
-npm ci                 # cài đúng lockfile, không sửa lockfile
-npm test               # vitest run: api client + CRUD flow
-npm run typecheck      # tsc -b
-npm run build          # tsc -b && vite build → dist/
-npm run dev            # dev server, proxy /api → http://127.0.0.1:8000 (chỉ khi dev)
+cd E:/courses/Ansible/three-tier-crud/frontend
+npm ci --ignore-scripts  # cài đúng lockfile, không sửa lockfile và không chạy lifecycle scripts
+npm test                 # vitest run: api client + CRUD flow
+npm run typecheck        # tsc -b
+npm run build            # tsc -b && vite build → dist/
+cd .. && git status --short
 ```
 
-`package-lock.json` là **nguồn chốt version** của frontend. Lần đầu tạo lockfile (không cài
-`node_modules`):
+`package-lock.json` là **nguồn chốt version** của frontend và phải được commit. Chỉ khi file này
+chưa tồn tại, tạo nó mà không tạo `node_modules` bằng:
 
 ```bash
-cd frontend && npm install --package-lock-only --ignore-scripts && git add package-lock.json
+cd E:/courses/Ansible/three-tier-crud/frontend
+npm install --package-lock-only --ignore-scripts
 ```
 
 ### 6.2. Backend (Python ≥ 3.11 local; image dùng 3.13)
 
 ```bash
-cd backend
+cd E:/courses/Ansible/three-tier-crud/backend
 python -m venv .venv
-.venv/bin/pip install --no-deps -r requirements-dev.txt && .venv/bin/pip check
-.venv/bin/python -m pytest
+.venv/Scripts/python -m pip install --no-deps -r requirements-dev.txt
+.venv/Scripts/python -m pip check
+.venv/Scripts/python -m pytest -q
+cd .. && git status --short
 ```
 
-Trên Windows thay `.venv/bin/` bằng `.venv\Scripts\`. Test không cần MongoDB thật: `tests/fakes.py`
-mô phỏng đúng subset của PyMongo Async mà app dùng, kể cả `DuplicateKeyError`,
+Trên Linux/macOS thay `.venv/Scripts/` bằng `.venv/bin/`. Test không cần MongoDB thật:
+`tests/fakes.py` mô phỏng đúng subset của PyMongo Async mà app dùng, kể cả `DuplicateKeyError`,
 `ServerSelectionTimeoutError` và ping treo để chứng minh timeout hữu hạn.
 
-### 6.3. Docker (theo runbook §6.3)
+### 6.3. Docker (theo runbook §6.3, chỉ sau khi checkpoint §5.3 PASS)
 
 ```bash
+cd E:/courses/Ansible/three-tier-crud
+source ~/phase2-build.env
 docker buildx build --platform linux/amd64 --load -t "$FRONTEND_IMAGE" ./frontend
 docker buildx build --platform linux/amd64 --load -t "$BACKEND_IMAGE" ./backend
 docker image inspect "$FRONTEND_IMAGE" --format '{{.Architecture}} {{.Config.User}}'   # amd64 101
 docker image inspect "$BACKEND_IMAGE"  --format '{{.Architecture}} {{.Config.User}}'   # amd64 10001:10001
 ```
 
-Cả hai Dockerfile chạy unit test trong stage build/test và stage runtime copy artefact từ stage đó,
-nên **build chỉ thành công khi test pass**. Chỉ chạy test không tạo image runtime:
-
-```bash
-docker build --target build ./frontend
-docker build --target test  ./backend
-```
-
-`npm ci` và `pip install` chỉ chạy trong stage build của Dockerfile; không có bước cài đặt nào
-trên máy host.
+Cả hai Dockerfile chạy lại unit test trong stage build/test và stage runtime chỉ được tạo từ kết
+quả đã qua test. Vì vậy test chạy trên host ở checkpoint §5.3 cho output kiểm tra sớm, còn build
+image ở §6.3 xác nhận test bằng toolchain của base image đã pin.
 
 ### 6.4. Chạy backend local (tùy chọn)
 
