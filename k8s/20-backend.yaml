@@ -1,0 +1,159 @@
+# =============================================================================
+# Backend FastAPI của ứng dụng three-tier CRUD.
+#
+# File gồm 2 tài nguyên, ngăn cách bằng ---:
+#   1. Deployment "backend": chạy 2 Pod FastAPI (cổng 8000); tự thay Pod khi Pod
+#      chết hoặc khi cập nhật image.
+#   2. Service "backend": địa chỉ nội bộ cố định backend:8000; chia tải cho các
+#      Pod đang Ready.
+#
+# Luồng traffic:
+#   frontend / Pod khác -> Service backend:8000 -> Pod backend (Ready) -> mongodb:27017
+#
+# File này KHÔNG tạo các đối tượng dưới đây; chúng phải có sẵn trước khi apply:
+#   - Namespace  three-tier
+#   - ConfigMap  app-config           (MONGODB_DATABASE, MONGODB_COLLECTION, ...)
+#   - Secret     backend-mongodb-uri  (key MONGODB_URI)
+# Nếu thiếu ConfigMap hoặc Secret, Pod sẽ kẹt ở trạng thái CreateContainerConfigError.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: three-tier
+  # Nhãn gắn lên chính Deployment để quản lý và tìm kiếm; nhãn này KHÔNG dùng để chọn Pod.
+  labels:
+    app.kubernetes.io/name: backend
+spec:
+  # Luôn duy trì 2 Pod.
+  replicas: 2
+  strategy:
+    # Cập nhật cuốn chiếu: thay dần từng Pod, không xoá hết rồi mới tạo lại.
+    type: RollingUpdate
+    rollingUpdate:
+      # Chỉ xoá Pod cũ sau khi Pod mới đã Ready -> lúc nào cũng còn ít nhất 2 Pod phục vụ.
+      maxUnavailable: 0
+      # Được tạo dư tối đa 1 Pod (tạm thời có 3 Pod) -> cluster phải đủ tài nguyên cho Pod thứ 3.
+      maxSurge: 1
+  # Deployment quản lý những Pod mang nhãn này. Phải khớp với template.metadata.labels bên dưới.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  # Khuôn mẫu dùng để tạo ra từng Pod.
+  template:
+    metadata:
+      # Nhãn gắn lên Pod. Deployment.spec.selector và Service.spec.selector đều chọn Pod theo nhãn này.
+      labels:
+        app.kubernetes.io/name: backend
+    spec:
+      # Không gắn token Kubernetes API vào Pod. App không gọi K8s API, nên nếu Pod bị
+      # chiếm quyền thì kẻ tấn công cũng không có token.
+      automountServiceAccountToken: false
+      # Cố gắng rải các Pod backend lên nhiều node khác nhau.
+      topologySpreadConstraints:
+        # maxSkew: 1 -> số Pod backend giữa các node chênh nhau tối đa 1.
+        - maxSkew: 1
+          # Mỗi node (theo hostname) được tính là một "vùng" khi đo độ chênh.
+          topologyKey: kubernetes.io/hostname
+          # Ưu tiên mềm: nếu không rải được (vd cluster chỉ có 1 node) thì vẫn xếp Pod,
+          # không để Pod bị Pending.
+          whenUnsatisfiable: ScheduleAnyway
+          # Chỉ đếm các Pod backend khi tính độ chênh.
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: backend
+      securityContext:
+        # Dùng bộ lọc syscall mặc định của container runtime để chặn các syscall nguy hiểm.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          # Image có cả tag lẫn digest. Kubernetes pull theo digest (sha256); tag chỉ giúp
+          # người đọc biết image được build từ commit cc98097.
+          image: docker.io/hieupham259/three-tier-backend:cc980970cc97@sha256:942442f424eed29e8c5214a0ae04e1f53e7e91179404a1885b20fc523d03416a
+          # Digest không bao giờ đổi, nên dùng lại image đã có sẵn trên node là an toàn.
+          imagePullPolicy: IfNotPresent
+          ports:
+            # Đặt tên cổng 8000 là "http"; probe và Service tham chiếu cổng bằng tên này.
+            - name: http
+              containerPort: 8000
+          # Đưa MỌI key của ConfigMap app-config vào container thành biến môi trường
+          # (vd MONGODB_DATABASE, MONGODB_COLLECTION; xem backend/app/config.py).
+          envFrom:
+            - configMapRef:
+                name: app-config
+          # Biến khai báo trong env sẽ đè biến cùng tên lấy từ envFrom.
+          env:
+            # URI chứa mật khẩu MongoDB nên lấy từ Secret, không đặt trong ConfigMap.
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: backend-mongodb-uri
+                  key: MONGODB_URI
+          # readinessProbe: quyết định Pod có được nhận traffic từ Service hay không.
+          # /api/health/ready ping MongoDB. Timeout ping trong app là 2s (MONGODB_PING_TIMEOUT_MS),
+          # ngắn hơn timeoutSeconds 3s, nên app kịp trả 503 thay vì để kubelet tự hết thời gian chờ.
+          # Kiểm tra mỗi 10s; hỏng 6 lần liên tiếp (~60s) thì Pod bị gỡ khỏi Service
+          # nhưng KHÔNG bị restart.
+          readinessProbe:
+            httpGet: { path: /api/health/ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # livenessProbe: kiểm tra process FastAPI có còn sống hay không.
+          # /api/health/live KHÔNG gọi MongoDB, nên khi MongoDB sập, Pod không bị restart liên tục.
+          # Kiểm tra mỗi 20s; hỏng 6 lần liên tiếp (~120s) thì kubelet restart container.
+          livenessProbe:
+            httpGet: { path: /api/health/live, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            # requests: lượng tài nguyên scheduler giữ chỗ khi chọn node cho Pod.
+            requests: { cpu: 100m, memory: 128Mi }
+            # limits: mức trần. Vượt CPU thì container bị bóp (throttle);
+            # vượt RAM thì container bị OOMKilled rồi restart.
+            limits: { cpu: 500m, memory: 384Mi }
+          securityContext:
+            # Process không thể leo thang quyền (vd qua binary setuid).
+            allowPrivilegeEscalation: false
+            # Bỏ toàn bộ Linux capability.
+            capabilities:
+              drop: ["ALL"]
+            # Filesystem của container chỉ đọc; chỗ cần ghi được gắn volume riêng (/tmp bên dưới).
+            readOnlyRootFilesystem: true
+            # Kubelet từ chối chạy container nếu image chạy bằng root. Điều kiện này được thoả
+            # vì backend/Dockerfile có USER 10001:10001 (UID dạng số nên kubelet kiểm tra được).
+            runAsNonRoot: true
+          # Gắn /tmp ghi được vì root filesystem là read-only; Python và thư viện cần chỗ ghi file tạm.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # emptyDir: thư mục tạm trên node, sinh ra cùng Pod và mất khi Pod bị xoá.
+        - name: tmp
+          emptyDir: {}
+---
+# Service "backend": địa chỉ nội bộ cố định dẫn tới các Pod backend.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: three-tier
+  labels:
+    app.kubernetes.io/name: backend
+spec:
+  # ClusterIP: Service có một IP ảo và chỉ truy cập được TỪ TRONG cluster, qua
+  # backend:8000 (cùng namespace) hoặc backend.three-tier.svc.cluster.local:8000.
+  # Khác MongoDB (headless, clusterIP: None): backend là stateless nên không cần DNS riêng
+  # cho từng Pod; một IP ảo chia tải là đủ.
+  type: ClusterIP
+  # Chọn Pod có nhãn này. Chỉ Pod đang Ready (readinessProbe đạt) mới nhận traffic.
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - name: http
+      # Cổng client gọi vào Service.
+      port: 8000
+      # Trỏ tới cổng tên "http" trên container (= 8000).
+      targetPort: http
