@@ -1,0 +1,157 @@
+# =============================================================================
+# Frontend React/Vite của ứng dụng three-tier CRUD, phục vụ bằng nginx-unprivileged.
+#
+# File gồm 2 tài nguyên, ngăn cách bằng ---:
+#   1. Deployment "frontend": chạy 2 Pod nginx (cổng 8080). Nginx trả file tĩnh của SPA và
+#      reverse proxy /api/ sang Service backend; tự thay Pod khi Pod chết hoặc khi cập nhật image.
+#   2. Service "frontend": địa chỉ nội bộ cố định frontend:80; chia tải cho các Pod đang Ready.
+#
+# Luồng traffic:
+#   browser -> Ingress -> Service frontend:80 -> Pod frontend:8080 (nginx)
+#     - /api/...     -> Service backend:8000 -> Pod backend
+#     - đường dẫn khác -> file tĩnh (index.html, /assets/...)
+#
+# File này KHÔNG tạo các đối tượng dưới đây; chúng phải có sẵn trước khi apply:
+#   - Namespace  three-tier
+#   - Service    backend  (20-backend.yaml; Pod backend chưa Ready cũng được)
+# Nginx phân giải tên "backend" trong proxy_pass (frontend/nginx.conf) MỘT LẦN lúc khởi động.
+# Nếu chưa có Service backend, nginx báo "host not found in upstream" rồi thoát -> Pod rơi vào
+# CrashLoopBackOff. Nginx cũng giữ luôn IP đã phân giải, nên nếu xoá rồi tạo lại Service backend
+# (ClusterIP mới) thì phải chạy: kubectl -n three-tier rollout restart deployment/frontend
+#
+# Frontend không cần ConfigMap hay Secret: bundle chỉ gọi URL tương đối /api, không chứa
+# địa chỉ backend hay credential.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: three-tier
+  # Nhãn gắn lên chính Deployment để quản lý và tìm kiếm; nhãn này KHÔNG dùng để chọn Pod.
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  # Luôn duy trì 2 Pod.
+  replicas: 2
+  strategy:
+    # Cập nhật cuốn chiếu: thay dần từng Pod, không xoá hết rồi mới tạo lại.
+    type: RollingUpdate
+    rollingUpdate:
+      # Chỉ xoá Pod cũ sau khi Pod mới đã Ready -> lúc nào cũng còn ít nhất 2 Pod phục vụ.
+      maxUnavailable: 0
+      # Được tạo dư tối đa 1 Pod (tạm thời có 3 Pod) -> cluster phải đủ tài nguyên cho Pod thứ 3.
+      maxSurge: 1
+  # Deployment quản lý những Pod mang nhãn này. Phải khớp với template.metadata.labels bên dưới.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  # Khuôn mẫu dùng để tạo ra từng Pod.
+  template:
+    metadata:
+      # Nhãn gắn lên Pod. Deployment.spec.selector và Service.spec.selector đều chọn Pod theo nhãn này.
+      labels:
+        app.kubernetes.io/name: frontend
+    spec:
+      # Không gắn token Kubernetes API vào Pod. Nginx không gọi K8s API, nên nếu Pod bị
+      # chiếm quyền thì kẻ tấn công cũng không có token.
+      automountServiceAccountToken: false
+      # Cố gắng rải các Pod frontend lên nhiều node khác nhau.
+      topologySpreadConstraints:
+        # maxSkew: 1 -> số Pod frontend giữa các node chênh nhau tối đa 1.
+        - maxSkew: 1
+          # Mỗi node (theo hostname) được tính là một "vùng" khi đo độ chênh.
+          topologyKey: kubernetes.io/hostname
+          # Ưu tiên mềm: nếu không rải được (vd cluster chỉ có 1 node) thì vẫn xếp Pod,
+          # không để Pod bị Pending.
+          whenUnsatisfiable: ScheduleAnyway
+          # Chỉ đếm các Pod frontend khi tính độ chênh.
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      securityContext:
+        # Dùng bộ lọc syscall mặc định của container runtime để chặn các syscall nguy hiểm.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          # Image có cả tag lẫn digest. Kubernetes pull theo digest (sha256); tag chỉ giúp
+          # người đọc biết image được build từ commit cc98097.
+          image: docker.io/hieupham259/three-tier-frontend:cc980970cc97@sha256:c534d2378b4449ff56cb568a6b26e732a43db53ef171dea3e88a49741e7972f7
+          # Digest không bao giờ đổi, nên dùng lại image đã có sẵn trên node là an toàn.
+          imagePullPolicy: IfNotPresent
+          ports:
+            # Đặt tên cổng 8080 là "http"; probe và Service tham chiếu cổng bằng tên này.
+            # nginx-unprivileged nghe ở 8080 (không phải 80) vì chạy non-root: dùng cổng >= 1024
+            # thì không cần capability NET_BIND_SERVICE. Service bên dưới vẫn mở cổng 80 cho client.
+            - name: http
+              containerPort: 8080
+          # readinessProbe: quyết định Pod có được nhận traffic từ Service hay không.
+          # /healthz do nginx trả thẳng 200 "ok": không đọc disk, không gọi backend. Vì vậy khi
+          # backend sập, Pod frontend vẫn Ready và vẫn phục vụ giao diện; chỉ các request /api/
+          # nhận lỗi 502/504 từ nginx.
+          # failureThreshold không khai báo nên dùng mặc định 3: kiểm tra mỗi 10s; hỏng 3 lần
+          # liên tiếp (~30s) thì Pod bị gỡ khỏi Service nhưng KHÔNG bị restart.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          # livenessProbe: kiểm tra process nginx có còn sống hay không. Dùng chung /healthz;
+          # endpoint này không phụ thuộc backend nên khi backend sập, Pod không bị restart liên tục.
+          # Kiểm tra mỗi 20s; hỏng 3 lần liên tiếp (mặc định, ~60s) thì kubelet restart container.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          # Nginx chỉ trả file tĩnh và proxy request, nên cần ít tài nguyên hơn backend.
+          resources:
+            # requests: lượng tài nguyên scheduler giữ chỗ khi chọn node cho Pod.
+            requests: { cpu: 50m, memory: 64Mi }
+            # limits: mức trần. Vượt CPU thì container bị bóp (throttle);
+            # vượt RAM thì container bị OOMKilled rồi restart.
+            limits: { cpu: 250m, memory: 128Mi }
+          securityContext:
+            # Process không thể leo thang quyền (vd qua binary setuid).
+            allowPrivilegeEscalation: false
+            # Bỏ toàn bộ Linux capability.
+            capabilities:
+              drop: ["ALL"]
+            # Filesystem của container chỉ đọc; chỗ cần ghi được gắn volume riêng (/tmp bên dưới).
+            readOnlyRootFilesystem: true
+            # Kubelet từ chối chạy container nếu image chạy bằng root. Điều kiện này được thoả
+            # vì base image nginxinc/nginx-unprivileged có USER 101 (UID dạng số nên kubelet
+            # kiểm tra được).
+            runAsNonRoot: true
+          # Gắn /tmp ghi được vì root filesystem là read-only; nginx ghi nginx.pid và các thư mục
+          # tạm (client_temp, proxy_temp, ...) vào /tmp (xem frontend/nginx.conf).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # emptyDir: thư mục tạm trên node, sinh ra cùng Pod và mất khi Pod bị xoá.
+        - name: tmp
+          emptyDir: {}
+---
+# Service "frontend": địa chỉ nội bộ cố định dẫn tới các Pod frontend; Ingress trỏ vào Service này.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: three-tier
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  # ClusterIP: Service có một IP ảo và chỉ truy cập được TỪ TRONG cluster, qua
+  # frontend:80 (cùng namespace) hoặc frontend.three-tier.svc.cluster.local:80.
+  # Người dùng bên ngoài đi vào qua Ingress (không nằm trong file này). Muốn thử nhanh khi
+  # chưa có Ingress: kubectl -n three-tier port-forward svc/frontend 8080:80
+  # rồi mở http://localhost:8080
+  type: ClusterIP
+  # Chọn Pod có nhãn này. Chỉ Pod đang Ready (readinessProbe đạt) mới nhận traffic.
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      # Cổng client (vd Ingress) gọi vào Service: cổng HTTP chuẩn 80.
+      port: 80
+      # Trỏ tới cổng tên "http" trên container (= 8080). Service chuyển tiếp 80 -> 8080.
+      targetPort: http
